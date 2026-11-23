@@ -1,0 +1,27 @@
+# Configuration yamllint (job lint, .github/workflows/ci.yml)
+# Lancer en local : uvx yamllint --strict .
+extends: default
+
+ignore: |
+  .git/
+  .cache/
+  .venv/
+
+rules:
+  # Commentaires d'en-tête et expressions longues : pas de limite de longueur
+  line-length: disable
+  # Pas de "---" en début de fichier
+  document-start: disable
+  # "on:" est une clé GitHub Actions, pas un booléen
+  truthy:
+    allowed-values: ["true", "false"]
+    check-keys: false
+  comments:
+    min-spaces-from-content: 1
+  indentation:
+    spaces: 2
+    indent-sequences: consistent
+  # Ancres YAML : étapes partagées entre jobs (≈ extends GitLab)
+  anchors:
+    forbid-undeclared-aliases: true
+    forbid-unused-anchors: true
