@@ -1,0 +1,215 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Brique commune : règles, contrôles et tests — VERSION VITRINE SIMPLIFIÉE
+#
+# Appelée par python-package.example.yml et python-docker.example.yml
+# (uses: ./.github/workflows/python-checks.yml : même dépôt, même commit).
+# Écrite une fois, utilisée par les deux pipelines : c'est le rôle des jobs
+# cachés + extends côté GitLab.
+#
+# Jobs :
+#   rules            : classe la ref (branche, release, pré-version, déploiement)
+#                      et valide les inputs ; les autres jobs lisent ses sorties
+#   secret-detection : gitleaks, historique complet (bloquant)
+#   ruff             : lint + formatage (bloquant, sauf ruff_allow_failure)
+#   pytest           : tests + couverture (désactivable : pytest_enabled)
+#   dependency-scan  : pip-audit (bloquant, sauf dependency_scan_allow_failure)
+#
+# Les inputs ne sont jamais interpolés dans les scripts : ils passent par env:.
+# ─────────────────────────────────────────────────────────────────────────────
+name: python-checks
+
+on:
+  workflow_call:
+    inputs:
+      python_version:
+        type: string
+        default: "3.12"
+      project_dir:
+        type: string
+        default: "."
+      requirements_files:
+        type: string
+        default: "requirements.txt"
+      project_extras:
+        type: string
+        default: "test"
+      pytest_enabled:
+        type: boolean
+        default: true
+      pytest_args:
+        type: string
+        default: "-v"
+      pytest_cov_source:
+        type: string
+        default: "."
+      ruff_allow_failure:
+        type: boolean
+        default: false
+      dependency_scan_allow_failure:
+        type: boolean
+        default: false
+      deploy_mode:
+        description: "Validé ici : none, compose ou helm"
+        type: string
+        default: "none"
+    outputs:
+      ci:
+        description: "true : branche ou tag de release (contrôles, tests, build)"
+        value: ${{ jobs.rules.outputs.ci }}
+      kind:
+        description: "branch, release (V-x.y.z), rc (V-x.y.z-rcN), preproduction (PPR-…), production (PRD-…) ou none"
+        value: ${{ jobs.rules.outputs.kind }}
+      version:
+        description: "x.y.z (ou x.y.z-rcN) extrait du tag"
+        value: ${{ jobs.rules.outputs.version }}
+
+env:
+  GITLEAKS_IMAGE: "ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f"
+  RUFF_VERSION: "0.15.17"
+  PIP_AUDIT_VERSION: "2.7.3"
+
+permissions: {}
+
+jobs:
+  # ── Règles : une seule source de vérité pour les déclencheurs ───────────────
+  # Les contrôles et tests tournent aussi sur les tags : rien n'est publié sans eux.
+  # Un tag PPR/PRD ne déclenche que le déploiement (l'image a déjà été validée).
+  rules:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      ci: ${{ steps.rules.outputs.ci }}
+      kind: ${{ steps.rules.outputs.kind }}
+      version: ${{ steps.rules.outputs.version }}
+    steps:
+      - id: rules
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          DEPLOY_MODE: ${{ inputs.deploy_mode }}
+        run: |
+          set -euo pipefail
+          case "$DEPLOY_MODE" in none | compose | helm) ;; *)
+            echo "::error title=Input invalide::deploy_mode='$DEPLOY_MODE' (none, compose ou helm)"; exit 1 ;;
+          esac
+          kind=none version=""
+          semver='[0-9]+\.[0-9]+\.[0-9]+'
+          if [ "$REF_TYPE" != "tag" ]; then kind=branch
+          elif [[ "$REF_NAME" =~ ^V-($semver)$ ]]; then kind=release version="${BASH_REMATCH[1]}"
+          elif [[ "$REF_NAME" =~ ^V-($semver-rc[0-9]+)$ ]]; then kind=rc version="${BASH_REMATCH[1]}"
+          elif [[ "$REF_NAME" =~ ^PPR-($semver)-[0-9]{8}$ ]]; then kind=preproduction version="${BASH_REMATCH[1]}"
+          elif [[ "$REF_NAME" =~ ^PRD-($semver)-[0-9]{8}$ ]]; then kind=production version="${BASH_REMATCH[1]}"
+          fi
+          case "$kind" in branch | release | rc) ci=true ;; *) ci=false ;; esac
+          printf 'ci=%s\nkind=%s\nversion=%s\n' "$ci" "$kind" "$version" | tee -a "$GITHUB_OUTPUT"
+
+  secret-detection:
+    needs: rules
+    if: needs.rules.outputs.ci == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # --redact : valeurs masquées ; faux positif : empreinte dans .gitleaksignore
+      - run: |
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
+            -v "$GITHUB_WORKSPACE:/repo" -w /repo "$GITLEAKS_IMAGE" \
+            git --redact --verbose /repo
+
+  # La configuration Ruff reste dans le pyproject.toml du projet : la pipeline
+  # exécute, le projet décide.
+  ruff:
+    needs: rules
+    if: needs.rules.outputs.ci == 'true'
+    continue-on-error: ${{ inputs.ruff_allow_failure }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - &checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - &setup_python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ inputs.python_version }}
+      - working-directory: ${{ inputs.project_dir }}
+        run: |
+          python -m pip install --quiet "ruff==$RUFF_VERSION"
+          ruff check --output-format=github
+          # En cas d'échec : lancer `ruff format` en local
+          ruff format --check --diff
+
+  pytest:
+    needs: rules
+    if: needs.rules.outputs.ci == 'true' && inputs.pytest_enabled
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - *checkout
+      - *setup_python
+      # Étape partagée avec dependency-scan (≈ extends .python_install_deps) :
+      # .venv dans project_dir, activé pour les étapes suivantes
+      - &install_deps
+        name: Installer les dépendances (.venv)
+        working-directory: ${{ inputs.project_dir }}
+        env:
+          REQUIREMENTS_FILES: ${{ inputs.requirements_files }}
+          PROJECT_EXTRAS: ${{ inputs.project_extras }}
+        run: |
+          set -euo pipefail
+          python -m venv .venv
+          # shellcheck disable=SC1091
+          . .venv/bin/activate
+          python -m pip install --quiet --upgrade pip
+          for f in $REQUIREMENTS_FILES; do
+            if [ -f "$f" ]; then python -m pip install -r "$f"; fi
+          done
+          if [ -f pyproject.toml ]; then
+            if [ -n "$PROJECT_EXTRAS" ]; then target=".[$PROJECT_EXTRAS]"; else target="."; fi
+            python -m pip install -e "$target"
+          fi
+          echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+      - working-directory: ${{ inputs.project_dir }}
+        env:
+          PYTEST_ARGS: ${{ inputs.pytest_args }}
+          PYTEST_COV_SOURCE: ${{ inputs.pytest_cov_source }}
+        run: |
+          python -m pip install --quiet pytest pytest-cov
+          # shellcheck disable=SC2086
+          python -m pytest $PYTEST_ARGS --cov="$PYTEST_COV_SOURCE" --cov-report=term-missing \
+            --junitxml="$GITHUB_WORKSPACE/pytest-report.xml"
+          { echo "### Couverture"; python -m coverage report --format=markdown; } >> "$GITHUB_STEP_SUMMARY"
+
+  # Paquets réellement installés (transitifs compris) ; pip-audit est installé
+  # hors du .venv pour ne pas s'auditer lui-même.
+  dependency-scan:
+    needs: rules
+    if: needs.rules.outputs.ci == 'true'
+    continue-on-error: ${{ inputs.dependency_scan_allow_failure }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - *checkout
+      - *setup_python
+      - *install_deps
+      - working-directory: ${{ inputs.project_dir }}
+        run: |
+          set -euo pipefail
+          python -m pip freeze --exclude-editable > "$RUNNER_TEMP/requirements-audit.txt"
+          "$pythonLocation/bin/python" -m pip install --quiet "pip-audit==$PIP_AUDIT_VERSION"
+          # --no-deps --disable-pip : la liste figée est déjà complète
+          "$pythonLocation/bin/python" -m pip_audit --requirement "$RUNNER_TEMP/requirements-audit.txt" \
+            --no-deps --disable-pip --desc on --progress-spinner off

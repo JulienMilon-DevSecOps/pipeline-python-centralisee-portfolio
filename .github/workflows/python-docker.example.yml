@@ -1,0 +1,279 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Workflow réutilisable : application Python conteneurisée (ex : API FastAPI)
+#                         — VERSION VITRINE SIMPLIFIÉE
+#
+# Usage (projet consommateur) : examples/consumer-api/ci.yml
+#   uses: my-org/pipeline-python-factory/.github/workflows/python-docker.example.yml@1.0.0
+#
+# Déroulé :
+#   checks (python-checks.yml) : rules, secret-detection, ruff, pytest, dependency-scan
+#   docker-build : branches → build sans push ; V-x.y.z → push de <image>:x.y.z
+#   trivy-scan   : V-x.y.z, bloquant sur scan_severity (CVE corrigeables)
+#   publish-image: V-x.y.z, "latest" posé sur l'image scannée
+#   deploy-*     : PPR-x.y.z-AAAAMMJJ / PRD-x.y.z-AAAAMMJJ — EXEMPLE ILLUSTRATIF
+#                  (Docker Compose ou Helm selon deploy_mode)
+#
+# Simplification de la vitrine : le tag de version est poussé dès le build, puis
+# scanné. Une chaîne plus stricte ne pousse qu'un tag technique au build et pose
+# les tags définitifs après le scan.
+# ─────────────────────────────────────────────────────────────────────────────
+name: python-docker
+
+on:
+  workflow_call:
+    inputs:
+      python_version:
+        type: string
+        default: "3.12"
+      project_dir:
+        type: string
+        default: "."
+      requirements_files:
+        type: string
+        default: "requirements.txt"
+      project_extras:
+        type: string
+        default: "test"
+      pytest_enabled:
+        type: boolean
+        default: true
+      pytest_args:
+        type: string
+        default: "-v"
+      pytest_cov_source:
+        type: string
+        default: "."
+      ruff_allow_failure:
+        type: boolean
+        default: false
+      dependency_scan_allow_failure:
+        type: boolean
+        default: false
+      dockerfile_path:
+        type: string
+        default: "Dockerfile"
+      docker_context:
+        type: string
+        default: "."
+      scan_severity:
+        description: "Niveaux de CVE qui font échouer le scan"
+        type: string
+        default: "CRITICAL"
+      scan_allow_failure:
+        type: boolean
+        default: false
+      deploy_mode:
+        description: "Déploiement illustratif : none, compose ou helm"
+        type: string
+        default: "none"
+      compose_file:
+        type: string
+        default: "deploy/compose.yml"
+      helm_chart:
+        type: string
+        default: "deploy/chart"
+    secrets:
+      DEPLOY_DOCKER_HOST:
+        description: "Mode compose : daemon distant (ssh://deploy@hote)"
+        required: false
+      DEPLOY_SSH_KEY:
+        description: "Mode compose : clé privée SSH du compte de déploiement"
+        required: false
+      DEPLOY_KNOWN_HOSTS:
+        description: "Mode compose : empreinte de l'hôte (ssh-keyscan)"
+        required: false
+      KUBECONFIG_CONTENT:
+        description: "Mode helm : contenu du kubeconfig"
+        required: false
+
+env:
+  TRIVY_IMAGE: "aquasec/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969"
+  CRANE_IMAGE: "gcr.io/go-containerregistry/crane/debug:v0.22.1@sha256:e78770b31258a3846f878036d9c1f63fbe4c871f9f56990bf77fd95c013e3c1b"
+
+permissions: {}
+
+jobs:
+  # ── check + test ────────────────────────────────────────────────────────────
+  checks:
+    uses: ./.github/workflows/python-checks.yml
+    permissions:
+      contents: read
+    with:
+      python_version: ${{ inputs.python_version }}
+      project_dir: ${{ inputs.project_dir }}
+      requirements_files: ${{ inputs.requirements_files }}
+      project_extras: ${{ inputs.project_extras }}
+      pytest_enabled: ${{ inputs.pytest_enabled }}
+      pytest_args: ${{ inputs.pytest_args }}
+      pytest_cov_source: ${{ inputs.pytest_cov_source }}
+      ruff_allow_failure: ${{ inputs.ruff_allow_failure }}
+      dependency_scan_allow_failure: ${{ inputs.dependency_scan_allow_failure }}
+      deploy_mode: ${{ inputs.deploy_mode }}
+
+  # ── build : un seul job, deux comportements (push ou non selon la ref) ──────
+  docker-build:
+    needs: checks
+    if: needs.checks.outputs.kind == 'branch' || needs.checks.outputs.kind == 'release'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: meta
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - if: needs.checks.outputs.kind == 'release'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ inputs.docker_context }}
+          file: ${{ inputs.dockerfile_path }}
+          push: ${{ needs.checks.outputs.kind == 'release' }}
+          tags: ${{ steps.meta.outputs.image }}:${{ needs.checks.outputs.version || github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.checks.outputs.version || github.sha }}
+          provenance: false
+
+  # ── scan : vulnérabilités de l'image publiée ────────────────────────────────
+  trivy-scan:
+    needs: [checks, docker-build]
+    if: needs.checks.outputs.kind == 'release'
+    continue-on-error: ${{ inputs.scan_allow_failure }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # .trivyignore à la racine du dépôt : CVE acceptées, avec justification
+      - env:
+          IMAGE_REF: ${{ needs.docker-build.outputs.image }}:${{ needs.checks.outputs.version }}
+          SCAN_SEVERITY: ${{ inputs.scan_severity }}
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ github.token }}
+        run: |
+          docker run --rm -e TRIVY_USERNAME -e TRIVY_PASSWORD -v "$GITHUB_WORKSPACE:/work:ro" -w /work \
+            "$TRIVY_IMAGE" image --exit-code 1 --severity "$SCAN_SEVERITY" --ignore-unfixed "$IMAGE_REF"
+
+  # ── publish : "latest" seulement après un scan réussi ───────────────────────
+  # Copie de registre à registre : aucune reconstruction.
+  publish-image:
+    needs: [checks, docker-build, trivy-scan]
+    if: needs.checks.outputs.kind == 'release'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      packages: write
+    steps:
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - env:
+          IMAGE: ${{ needs.docker-build.outputs.image }}
+          VERSION: ${{ needs.checks.outputs.version }}
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" -e DOCKER_CONFIG=/docker-config \
+            -v "$HOME/.docker:/docker-config:ro" --entrypoint crane "$CRANE_IMAGE" \
+            tag "$IMAGE:$VERSION" latest
+          echo "Publié : $IMAGE:$VERSION et $IMAGE:latest" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # ── deploy — EXEMPLE ILLUSTRATIF, non utilisé en production ─────────────────
+  # Même déclencheur (tag PPR/PRD), même version d'image (extraite du tag), deux
+  # mises en œuvre au choix (deploy_mode). L'environment GitHub porte :
+  #   - les secrets de déploiement, différents par environment ;
+  #   - la protection : "production" exige une approbation (Required reviewers),
+  #     ≈ when: manual de GitLab.
+  # concurrency : jamais deux déploiements en parallèle (≈ resource_group).
+  deploy-compose:
+    needs: checks
+    if: >-
+      inputs.deploy_mode == 'compose'
+      && (needs.checks.outputs.kind == 'preproduction' || needs.checks.outputs.kind == 'production')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: ${{ needs.checks.outputs.kind }}
+    concurrency:
+      group: deploy-${{ needs.checks.outputs.kind }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: read
+    env:
+      IMAGE_NAME: ghcr.io/${{ github.repository }}
+      IMAGE_TAG: ${{ needs.checks.outputs.version }}
+      COMPOSE_FILE: ${{ inputs.compose_file }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Accès SSH à l'hôte
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+      # Le client docker du runner pilote le daemon distant (DOCKER_HOST=ssh://...) ;
+      # le fichier compose référence image: ${IMAGE_NAME}:${IMAGE_TAG}
+      - env:
+          DOCKER_HOST: ${{ secrets.DEPLOY_DOCKER_HOST }}
+        run: |
+          echo "Déploiement de ${IMAGE_NAME,,}:$IMAGE_TAG (${GITHUB_REF_NAME%%-*})"
+          export IMAGE_NAME="${IMAGE_NAME,,}"
+          docker compose --file "$COMPOSE_FILE" pull
+          docker compose --file "$COMPOSE_FILE" up --detach --remove-orphans
+          docker compose --file "$COMPOSE_FILE" ps
+
+  deploy-helm:
+    needs: checks
+    if: >-
+      inputs.deploy_mode == 'helm'
+      && (needs.checks.outputs.kind == 'preproduction' || needs.checks.outputs.kind == 'production')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: ${{ needs.checks.outputs.kind }}
+    concurrency:
+      group: deploy-${{ needs.checks.outputs.kind }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # helm est préinstallé sur les runners ubuntu-latest ; KUBE_NAMESPACE est
+      # une variable d'environment GitHub (vars), pas un secret
+      - env:
+          KUBECONFIG_CONTENT: ${{ secrets.KUBECONFIG_CONTENT }}
+          KUBE_NAMESPACE: ${{ vars.KUBE_NAMESPACE }}
+          HELM_CHART: ${{ inputs.helm_chart }}
+          RELEASE: ${{ github.event.repository.name }}
+          IMAGE_TAG: ${{ needs.checks.outputs.version }}
+        run: |
+          set -euo pipefail
+          export KUBECONFIG="$RUNNER_TEMP/kubeconfig"
+          (umask 077 && printf '%s\n' "$KUBECONFIG_CONTENT" > "$KUBECONFIG")
+          # --atomic : retour automatique à la version précédente en cas d'échec
+          helm upgrade --install "$RELEASE" "$HELM_CHART" \
+            --namespace "$KUBE_NAMESPACE" \
+            --set image.repository="ghcr.io/${GITHUB_REPOSITORY,,}" \
+            --set image.tag="$IMAGE_TAG" \
+            --atomic --wait --timeout 5m
