@@ -1,0 +1,44 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Exemple de projet consommateur : API FastAPI livrée en image Docker
+# À placer dans .github/workflows/ci.yml du projet. Adapté du fichier d'un
+# projet consommateur réel : chemin de la pipeline remplacé par un exemple,
+# options réduites au contrat de la vitrine.
+#
+# Le fichier réel ajoute : dépendances via uv, base PostgreSQL jetable pour les
+# tests d'intégration, signature de l'image, et l'état explicite de chaque
+# contrôle de sécurité.
+# ─────────────────────────────────────────────────────────────────────────────
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+    # Releases et déploiements (illustratifs)
+    tags: ["V-*", "PPR-*", "PRD-*"]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type == 'branch' }}
+
+permissions:
+  contents: read
+  packages: write   # image sur ghcr.io
+
+jobs:
+  pipeline:
+    uses: my-org/pipeline-python-factory/.github/workflows/python-docker.example.yml@1.0.0
+    with:
+      python_version: "3.13"
+      # Couverture mesurée sur app/ (seuil défini dans pyproject.toml)
+      pytest_cov_source: app
+
+      # ── Sécurité : état des contrôles (valeurs explicites, lisibles en revue) ──
+      # La détection de secrets (gitleaks) est toujours active et bloquante.
+      ruff_allow_failure: false               # lint et formatage — bloquant
+      dependency_scan_allow_failure: true     # dépendances Python — non bloquant
+      scan_severity: CRITICAL                 # image — bloquant sur les CVE critiques corrigeables
+      scan_allow_failure: false
+
+      # ── Déploiement : aucun pour l'instant (none, compose ou helm) ──
+      deploy_mode: none
+    secrets: inherit

@@ -1,0 +1,43 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Exemple de projet consommateur : package Python publié sur PyPI
+# À placer dans .github/workflows/ci.yml du projet. Adapté du fichier d'un
+# projet consommateur réel : chemin de la pipeline remplacé par un exemple,
+# options réduites au contrat de la vitrine.
+#
+# Inputs typés : un nom d'input inconnu est refusé au démarrage du run
+# ("Unexpected input"), une valeur hors des choix autorisés est refusée par le
+# premier job (rules).
+#
+# Le fichier réel ajoute : dépendances via uv, base PostgreSQL jetable pour les
+# tests d'intégration, publication par Trusted Publishing (aucun secret stocké).
+# ─────────────────────────────────────────────────────────────────────────────
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["V-*"]
+
+# Un nouveau commit annule le run précédent de la branche ; jamais sur un tag
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type == 'branch' }}
+
+# Plafond des droits du GITHUB_TOKEN ; chaque job de la pipeline n'en prend que
+# ce dont il a besoin
+permissions:
+  contents: read
+
+jobs:
+  pipeline:
+    # Version épinglée : une nouvelle version de la pipeline ne change rien ici
+    # tant que ce numéro n'est pas modifié (par une PR, testée comme le reste)
+    uses: my-org/pipeline-python-factory/.github/workflows/python-package.example.yml@1.0.0
+    with:
+      python_version: "3.13"
+      # Couverture mesurée sur le package uniquement
+      pytest_cov_source: my_package
+      # Vulnérabilités des dépendances signalées sans bloquer la pipeline
+      dependency_scan_allow_failure: true
+    # PYPI_TOKEN / TEST_PYPI_TOKEN : secrets des environments pypi / testpypi
+    secrets: inherit

@@ -1,0 +1,83 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# CI de la vitrine
+#   - yamllint et actionlint (+ shellcheck des scripts) sur tout le dépôt ;
+#   - python-docker.example.yml appliquée à examples/sample-app : secret-detection,
+#     ruff, pytest, dependency-scan, docker-build (sans push sur une branche) ;
+#   - tags x.y.z : GitHub Release de la vitrine (notes tirées du CHANGELOG).
+# La vitrine se consomme elle-même comme le ferait un projet consommateur
+# (uses + inputs), ce qui prouve que les fichiers publiés s'exécutent.
+# ─────────────────────────────────────────────────────────────────────────────
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["[0-9]+.[0-9]+.[0-9]+"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type == 'branch' }}
+
+permissions: {}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: yamllint
+        run: |
+          python -m pip install --quiet "yamllint==1.35.1"
+          yamllint --strict --format github .
+      - name: actionlint
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/repo" -w /repo \
+            rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 -color
+
+  # Pipeline d'exemple appliquée à l'application d'exemple (même commit)
+  sample-app:
+    if: github.ref_type == 'branch' || github.event_name == 'pull_request'
+    uses: ./.github/workflows/python-docker.example.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      project_dir: examples/sample-app
+      pytest_cov_source: app
+      dockerfile_path: examples/sample-app/Dockerfile
+      docker_context: examples/sample-app
+      # Vitrine : une CVE publiée sur une dépendance ne doit pas casser le badge
+      dependency_scan_allow_failure: true
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          awk -v version="$TAG" '
+            index($0, "## [" version "]") == 1 { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" \
+            --notes-file "$RUNNER_TEMP/notes.md" --verify-tag
